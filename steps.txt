@@ -1,0 +1,242 @@
+================================================================================
+FIRST-PRINCIPLES ENGINEERING GUIDE: INGESTION, CHUNKING & CHROMADB VECTOR STORE
+Project: Railway Passenger Help Desk — AI Assistant
+Author: GenAI Nexus Engineering Cohort
+Style: First-Principles Engineering (Elon Musk Thinking Framework)
+================================================================================
+
+--------------------------------------------------------------------------------
+PART 1: THE CORE PHILOSOPHY (FIRST PRINCIPLES)
+--------------------------------------------------------------------------------
+Reasoning by analogy says: "Other RAG tutorials install LangChain, load a PDF, 
+call text_splitter(500), and throw it into a vector DB."
+That analogy fails immediately when applied to Indian Railway circulars.
+
+Why does it fail?
+1. Fundamental Truth 1 (Scans contain 0 text):
+   Government circulars are physically scanned paper bitmaps. Standard PDF parsers 
+   extract 0 characters. If your ingestion does not have OCR, your knowledge base 
+   literally does not contain the rule. The system will fail completely.
+2. Fundamental Truth 2 (Language & Glyphs):
+   Indian Railway rules are published bilingually (English and Devanagari Hindi). 
+   Hindi does not end sentences with English periods (.), it uses Purna Viram (।). 
+   If your chunker cuts Hindi sentences at arbitrary character bounds, the rule is 
+   sliced in half, and the retrieval engine loses context.
+3. Fundamental Truth 3 (Temporal Precedence):
+   Older rules (e.g., ARP was 120 days in 2015) are replaced by newer circulars 
+   (ARP reduced to 60 days in CC 10 of 2024). ChromaDB vectors do not know what year 
+   it is unless issuance dates and circular authorities are stored in the vector metadata.
+4. Fundamental Truth 4 (The Evaluation Contract):
+   The capstone evaluator strictly checks for:
+   {"sources": [{"doc": "filename.pdf", "page": 3}], "sql": null, "dont_know": false}
+   For web documents (HTML), the page MUST be null. 
+
+Every single line of code written below was engineered from these 4 truths.
+
+================================================================================
+PART 2: STEP-BY-STEP RECONSTRUCTION OF THE ENTIRE BUILD
+================================================================================
+
+--------------------------------------------------------------------------------
+STEP 1: EMPIRICAL DISCOVERY & TESTING
+--------------------------------------------------------------------------------
+What was done:
+- Tested both `pdfplumber` and `PyMuPDF` (fitz) on the railway circulars.
+- Discovered that `pymupdf` read multi-column tables top-down, breaking the tabular 
+  relationship between conditions and refund amounts.
+- Discovered that `pypdf` extracted text from digital PDFs, but returned empty 
+  strings on scanned PDFs (`rb_cc10_2024`, `rb_cc10_2025`, and pages 3-6 of `rb_cc08_2025`).
+- Solved the scanned text limitation by integrating `pypdfium2` (which renders pages 
+  to high-res image matrices) and `RapidOCR` with `onnxruntime`.
+
+--------------------------------------------------------------------------------
+STEP 2: MODULAR ARCHITECTURE (rhd_ingestion/)
+--------------------------------------------------------------------------------
+Created a standalone, zero-side-effect folder: `rhd_ingestion/`
+Files engineered:
+- extractor.py     -> Text & OCR extraction with Devanagari detection
+- chunker.py       -> Semantic chunking with overlap & metadata registry
+- run_pipeline.py   -> Pipeline runner that processes documents and outputs final_chunks.json
+- chroma_store.py   -> Embeddings generation & ChromaDB vector database creation
+- test_search.py    -> Benchmark evaluation test & interactive query CLI
+- requirements.txt  -> Dependencies with pinned minimum versions
+- README.md         -> Data contract & team handover documentation
+
+================================================================================
+PART 3: LINE-BY-LINE AND METHOD-BY-METHOD CODE EXPLANATION
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 1: rhd_ingestion/extractor.py (Text, OCR & Language Parsing)
+--------------------------------------------------------------------------------
+
+1. `is_devanagari(text: str) -> bool`
+   Explanation:
+   Uses Unicode regex `[\u0900-\u097F]` to count Devanagari characters. If a text 
+   snippet contains more than 20 Devanagari characters, it is classified as Hindi ("hi"). 
+   Otherwise, it is marked as English ("en").
+   Why: Enables your team to perform language-filtered vector queries in ChromaDB.
+
+2. `clean_text(text: str) -> str`
+   Explanation:
+   - Linebreak normalization: Unifies Windows CRLF and Unix LF to \n.
+   - De-hyphenation regex `r'(\b[a-zA-Z]+)-\n([a-zA-Z]+\b)'`: PDFs love justifying text 
+     by breaking words across lines (e.g., "cancell-\nation"). This regex stitches 
+     them back into "cancellation", preventing broken tokens in embeddings.
+   - Whitespace reduction: Collapses 3+ redundant newlines into 2, and cleans excess spaces.
+
+3. `get_ocr_engine() -> RapidOCR`
+   Explanation:
+   Implements a singleton pattern (lazy initialization). The RapidOCR ONNX model is 
+   loaded into memory only once when a scanned page is encountered, rather than 
+   re-instantiating the neural network for every page.
+
+4. `extract_scanned_page_with_ocr(pdf_path: str, page_index: int) -> str`
+   Explanation:
+   - `pdfium.PdfDocument(pdf_path)` opens the file via C++ PDFium bindings.
+   - `page.render(scale=2.0).to_pil()` rasterizes the vector/bitmap page at ~144-200 DPI. 
+     (First-principles: DPI < 100 makes Hindi matras illegible; DPI > 300 causes CPU 
+     throttling with negligible accuracy gains. Scale 2.0 is the sweet spot).
+   - `ocr(np.array(image))` feeds the image matrix to the deep learning detection 
+     and recognition models (DBNet + SVTR).
+   - Returns extracted text strings joined by newlines.
+
+5. `extract_from_pdf(pdf_path: str) -> List[Dict]`
+   Explanation:
+   - Iterates through each page using `pypdf.PdfReader`.
+   - Reads page text. If `len(cleaned) < 25`, the page has no digital font stream—it 
+     is a scanned image.
+   - Automatically triggers `extract_scanned_page_with_ocr()`.
+   - Returns a structured list of page dictionaries with page_number, text, and language.
+
+6. `extract_from_html(html_path: str) -> List[Dict]`
+   Explanation:
+   - Reads HTML files (`indianrail_refund_rules_2015.html`, `pib_2026-03-24_reform_express.html`).
+   - Parses the DOM using `BeautifulSoup`.
+   - Strips `<script>` and `<style>` noise tags.
+   - Extracts plain text and explicitly sets `"page_number": None`.
+   - Why: Capstone rule mandates that web page sources must return null for page.
+
+--------------------------------------------------------------------------------
+MODULE 2: rhd_ingestion/chunker.py (Semantic Chunking & Precedence)
+--------------------------------------------------------------------------------
+
+1. `METADATA_REGISTRY`
+   Explanation:
+   A dictionary mapping every document filename to its official issuance date and 
+   issuing authority:
+   - `indianrail_refund_rules_2015.html` -> 2015-11-12
+   - `irctc_refund_rules_jan2026.pdf`    -> 2026-01-01
+   - `rb_cc10_2024_advance_reservation.pdf` -> 2024-10-16
+   - `rb_cc08_2026_vande_bharat_sleeper_refund.pdf` -> 2026-01-19
+   Why: Satisfies the Capstone rule: "When they disagree, the newer one wins."
+
+2. `split_text_recursive(text: str, chunk_size=650, chunk_overlap=120) -> List[str]`
+   Explanation:
+   - Implements hierarchical recursive splitting.
+   - Priority separators list: `["\n\n", "\n", "। ", ". ", "? ", " "]`
+   - It first tries to keep entire paragraphs together (`\n\n`).
+   - If a paragraph is larger than 650 characters, it falls back to lines (`\n`).
+   - If a line is too long, it splits on Hindi full-stops (`। `) and English periods (`. `).
+   - If still too long, it splits on whitespace (` `).
+   - Sliding Window Overlap: Every subsequent chunk prefixes the last 120 characters 
+     from the previous chunk as `...{overlap_text}\n{current_text}`.
+     Why: Ensures boundary sentences and qualifying conditions are not severed.
+
+3. `build_chunks(pages_data, source_filename, ...) -> List[Dict]`
+   Explanation:
+   Constructs the exact JSON contract expected by ChromaDB and the evaluators:
+   - `id`: Guaranteed unique string: `{source}_p{page}_c{index}`
+   - `text`: Chunk content with overlap
+   - `source`: Filename
+   - `page`: Page number (int) or None for HTML
+   - `metadata`: Contains `date`, `authority`, `language`, and `chunk_index`.
+
+--------------------------------------------------------------------------------
+MODULE 3: rhd_ingestion/run_pipeline.py (Pipeline Execution)
+--------------------------------------------------------------------------------
+
+1. `find_documents_dir() -> Path`
+   Explanation:
+   Dynamically looks for `documents/` or `data/` both in the local directory and 
+   the parent project directory. Allows the code to run both inside the full project 
+   and inside a standalone cloned repository.
+
+2. `run()`
+   Explanation:
+   - Scans all files in the documents directory.
+   - Dispatches each document to `extract_document()`.
+   - Passes page text to `build_chunks()`.
+   - Aggregates all chunks and saves them formatted into `rhd_ingestion/output/final_chunks.json`.
+   - Logs statistics: Total chunks (145), English chunks (123), Hindi chunks (22).
+
+--------------------------------------------------------------------------------
+MODULE 4: rhd_ingestion/chroma_store.py (Embeddings & Vector Indexing)
+--------------------------------------------------------------------------------
+
+1. `get_chroma_collection(db_path, collection_name) -> Collection`
+   Explanation:
+   - Initializes a persistent disk-backed ChromaDB client (`chromadb.PersistentClient`).
+   - Configures ChromaDB's built-in `DefaultEmbeddingFunction()`.
+     (This downloads and caches the ONNX-quantized `all-MiniLM-L6-v2` neural network. 
+     It generates 384-dimensional dense vectors locally on your CPU in milliseconds, 
+     without needing paid API keys or internet access during evaluation).
+   - Sets distance space to `{"hnsw:space": "cosine"}` for cosine similarity search.
+
+2. `push_chunks_to_chroma(chunks_path, db_path, batch_size=50) -> int`
+   Explanation:
+   - Reads `final_chunks.json`.
+   - Sanitizes metadata: ChromaDB rejects `None` values, so HTML `page: None` is 
+     safely converted to `-1`.
+   - Uses `collection.upsert()` in batches of 50 to prevent memory spikes.
+   - Writes the index into persistent files under `rhd_ingestion/chroma_db/`.
+
+3. `search_chroma(query: str, k: int = 3, language_filter=None)`
+   Explanation:
+   - Converts the incoming query into a 384-d vector.
+   - Performs Approximate Nearest Neighbors (ANN) using the HNSW cosine graph.
+   - Supports metadata filtering: e.g. `where={"language": "hi"}`.
+   - Returns the top-k most relevant chunks and their provenance.
+
+--------------------------------------------------------------------------------
+MODULE 5: rhd_ingestion/test_search.py (Verification & Live Search CLI)
+--------------------------------------------------------------------------------
+
+1. `run_benchmark_tests()`
+   Explanation:
+   Automates tests for the hardest Capstone query scenarios:
+   - Scanned circular retrieval: Validates that "ARP 60 days" is retrieved from 
+     `rb_cc10_2024_advance_reservation.pdf`.
+   - Complex refund slabs: Validates 48-hour cancellation fees from IRCTC 2026 rules.
+   - Aadhaar authentication: Validates CC 08 of 2025 Tatkal rules.
+   - Multilingual query: Validates Hindi retrieval from Gazette G.S.R. 41(E).
+
+2. `interactive_mode()`
+   Explanation:
+   Allows you or the evaluator to type arbitrary questions into the terminal 
+   via `python test_search.py --interactive` and receive instant top-ranked chunk results.
+
+================================================================================
+PART 4: HOW TO RUN AND PROVE EVERYTHING WORKS
+================================================================================
+
+In your terminal (inside the repo folder):
+
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Run the ingestion pipeline (converts documents -> clean chunks):
+   python run_pipeline.py
+
+3. Build the ChromaDB vector database (converts chunks -> 384d vectors):
+   python chroma_store.py
+
+4. Run the benchmark verification:
+   python test_search.py
+
+5. Run live passenger question tests:
+   python test_search.py --interactive
+
+================================================================================
+END OF GUIDE — BUILT ON FIRST PRINCIPLES
+================================================================================
