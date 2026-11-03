@@ -9,13 +9,15 @@
 
 This module handles the entire extraction-to-vector pipeline. Anyone on the team can clone this repository, run two commands, and have a fully loaded, high-accuracy ChromaDB vector index with zero extra configuration.
 
-### Fresh Clone Commands:
+### Quick Start Commands:
+Inside your cloned `ingest` repo (`D:\Railway_help_desk\ingest>`):
+
 ```bash
 # 1. Run extraction + chunking across all 7 official documents
-python -m rhd_ingestion.run_pipeline
+python run_pipeline.py
 
 # 2. Generate embeddings and index vectors into ChromaDB
-python -m rhd_ingestion.chroma_store
+python chroma_store.py
 ```
 
 ---

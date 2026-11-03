@@ -5,6 +5,7 @@ Supports both English and Hindi vector similarity search.
 """
 
 import os
+import sys
 import json
 import logging
 from pathlib import Path
@@ -13,20 +14,24 @@ from typing import List, Dict, Any, Optional
 import chromadb
 from chromadb.utils import embedding_functions
 
+CURRENT_DIR = Path(__file__).resolve().parent
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rhd_chroma")
 
 
 def get_chroma_collection(
-    db_path: str = "rhd_ingestion/chroma_db",
+    db_path: Optional[str] = None,
     collection_name: str = "railway_passenger_rules"
 ):
     """
     Initializes a persistent ChromaDB collection.
     Uses Chroma's bundled all-MiniLM-L6-v2 ONNX embedding function (fast, local, free, zero-config).
     """
-    client = chromadb.PersistentClient(path=db_path)
+    if db_path is None:
+        db_path = str(CURRENT_DIR / "chroma_db")
 
+    client = chromadb.PersistentClient(path=db_path)
     embedding_fn = embedding_functions.DefaultEmbeddingFunction()
     
     collection = client.get_or_create_collection(
@@ -38,14 +43,19 @@ def get_chroma_collection(
 
 
 def push_chunks_to_chroma(
-    chunks_path: str = "rhd_ingestion/output/final_chunks.json",
-    db_path: str = "rhd_ingestion/chroma_db",
+    chunks_path: Optional[str] = None,
+    db_path: Optional[str] = None,
     collection_name: str = "railway_passenger_rules",
     batch_size: int = 50
 ) -> int:
     """
     Reads chunks and upserts them into ChromaDB in batches.
     """
+    if chunks_path is None:
+        chunks_path = str(CURRENT_DIR / "output" / "final_chunks.json")
+    if db_path is None:
+        db_path = str(CURRENT_DIR / "chroma_db")
+
     chunks_file = Path(chunks_path)
     if not chunks_file.exists():
         raise FileNotFoundError(f"Chunks file not found at: {chunks_file}. Run run_pipeline.py first.")
@@ -64,12 +74,10 @@ def push_chunks_to_chroma(
         ids.append(c["id"])
         documents.append(c["text"])
         meta = c["metadata"].copy()
-        
         if meta.get("page") is None:
-            meta["page"] = -1  
+            meta["page"] = -1
         metadatas.append(meta)
 
-    # Upsert in batches to avoid memory/IPC spikes
     total_added = 0
     for i in range(0, len(chunks), batch_size):
         b_ids = ids[i:i + batch_size]
@@ -92,12 +100,15 @@ def search_chroma(
     query: str,
     k: int = 3,
     language_filter: Optional[str] = None,
-    db_path: str = "rhd_ingestion/chroma_db",
+    db_path: Optional[str] = None,
     collection_name: str = "railway_passenger_rules"
 ):
     """
     Performs cosine similarity search on the ChromaDB collection.
     """
+    if db_path is None:
+        db_path = str(CURRENT_DIR / "chroma_db")
+
     collection = get_chroma_collection(db_path=db_path, collection_name=collection_name)
     where_clause = {"language": language_filter} if language_filter else None
 

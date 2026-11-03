@@ -6,22 +6,45 @@ and saves `final_chunks.json` for teammate 2 (ChromaDB insertion).
 """
 
 import os
+import sys
 import json
 import logging
 from pathlib import Path
 
-from .extractor import extract_document
-from .chunker import build_chunks
+# Add current folder to sys.path so standalone execution works
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+try:
+    from .extractor import extract_document
+    from .chunker import build_chunks
+except ImportError:
+    from extractor import extract_document
+    from chunker import build_chunks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rhd_ingestion")
 
 
+def find_documents_dir() -> Path:
+    """Finds documents directory whether run inside parent project or standalone cloned repo."""
+    candidates = [
+        CURRENT_DIR.parent / "documents",
+        CURRENT_DIR / "documents",
+        CURRENT_DIR.parent / "data",
+        CURRENT_DIR / "data",
+    ]
+    for c in candidates:
+        if c.exists() and any(c.glob("*.*")):
+            return c
+    # Fallback default
+    return CURRENT_DIR.parent / "documents"
+
+
 def run():
-    
-    project_root = Path(__file__).resolve().parent.parent
-    documents_dir = project_root / "documents"
-    output_dir = project_root / "rhd_ingestion" / "output"
+    documents_dir = find_documents_dir()
+    output_dir = CURRENT_DIR / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_file = output_dir / "final_chunks.json"
@@ -71,4 +94,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
